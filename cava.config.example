@@ -1,0 +1,32 @@
+# CAVA 风格配置示例，用于 spectrum.py --config
+[general]
+framerate = 180
+lower_cutoff_freq = 20
+higher_cutoff_freq = 20000
+
+# 主题：仅 sunset（橙粉 #BD5075）
+[theme]
+theme = sunset
+# 可选覆盖：
+# background = #12090d
+# line_bottom = #4a1f30
+# line_top = #BD5075
+# grid = #2a141e
+# text = #8a5a6b
+# border = #1a0d12
+
+# CAVA 兼容段（与 [theme] 同义）
+[color]
+background = #12090d
+gradient_color_1 = #4a1f30
+gradient_color_2 = #BD5075
+foreground = #BD5075
+
+[smoothing]
+# 非对称 Attack/Release（替代单 EMA）：上升快冲（kick 立即冲）、下降慢落（保留鼓点形状）
+attack = 0.80
+release = 0.25
+
+[window]
+# 内容透明度 0.05~1.0（1.0=不透明）。默认 0.25（2026-08-18 由 0.50 改）；折线/坐标数字/dock 恒不透明
+opacity = 0.25
