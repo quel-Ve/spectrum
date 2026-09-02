@@ -261,6 +261,11 @@ def freq_to_midi(freq):
     return int(round(69.0 + 12.0 * math.log2(freq / 440.0)))
 
 
+# 轴标注模式（Label 按钮循环）：频率数字 → 音名标注 → 最简（隐藏全部刻度数字）
+LABEL_FREQ, LABEL_NOTES, LABEL_MIN = 0, 1, 2
+LABEL_MODE_TEXT = ("Freq", "Note", "Min")
+
+
 def db_display(db, clamp=NOTE_NUM_CLAMP_DB):
     """'+70dBFS' 显示值：dBFS + 70，低于 clamp 则钳制到 clamp（-40 = -110dBFS）。"""
     return max(db + DB_DISPLAY_OFFSET, clamp)
@@ -377,28 +382,36 @@ def zorder_insert(always_on_top):
     return -1 if always_on_top else 1
 
 
-def list_input_devices():
-    """dev 切换目标输入设备（2026-08-18）：仅保留 扬声器输出(立体声混音) /
-    realtek 2nd output / 麦克风输入，按设备名去重，顺序：立体声混音→2nd→麦克风。"""
-    seen = set()
-    mixes, second, mics = [], [], []
-    for i, d in enumerate(sd.query_devices()):
+def filter_sources(devices):
+    """Dev 信号源筛选（2026-08-27）：只保留 耳机输出（立体声混音）与 麦克风输入，其余通道不入循环。
+
+    - 耳机输出：优先含 'Realtek(R)' 的主混音，否则取第一个 立体声混音
+    - 麦克风：优先含 'UGREEN' 的 USB 麦，否则取第一个 麦克风
+    - 顺序固定：耳机输出 → 麦克风；每源只取 1 个设备
+    """
+    earphones, mics = [], []
+    for i, d in enumerate(devices):
         if d["max_input_channels"] <= 0:
             continue
         name = d["name"]
-        n = name.lower()
         if "立体声混音" in name:
-            key, bucket = "mix:" + name, mixes
+            earphones.append((i, d))
         elif "麦克风" in name:
-            key, bucket = "mic:" + name, mics
-        elif "realtek" in n and "2nd" in n:
-            key, bucket = "2nd:" + name, second
-        else:
-            continue
-        if key not in seen:
-            seen.add(key)
-            bucket.append((i, d))
-    return mixes + second + mics
+            mics.append((i, d))
+        # 其余全部忽略（Voicemeeter/CABLE/线路输入/realtek 2nd 等）
+
+    def _first(candidates, prefer):
+        for i, d in candidates:
+            if prefer in d["name"]:
+                return (i, d)
+        return candidates[0] if candidates else None
+
+    return [x for x in (_first(earphones, "Realtek(R)"), _first(mics, "UGREEN")) if x is not None]
+
+
+def list_input_devices():
+    """dev 切换目标输入设备：filter_sources(sd.query_devices()) 的薄壳。"""
+    return filter_sources(sd.query_devices())
 
 
 # ---- FFT 引擎（与 UI 分离）----
@@ -560,7 +573,7 @@ class SpectrumWindow(QWidget):
 
         self.axis_font = _pick_font(8)
         self.note_font = _pick_font(8)
-        self.show_notes = False
+        self.label_mode = LABEL_FREQ   # 轴标注模式：Freq → Note → Min 循环
 
         # 渲染缓存（按 plot 状态 × 频率网格 键控）+ 曲线更新率计数
         self._proj_cache = {}
@@ -830,8 +843,15 @@ class SpectrumWindow(QWidget):
         self.btn_scale.setText("Log" if self.log_scale else "Lin")
         self.update()
 
-    def toggle_notes(self):
-        self.show_notes = not self.show_notes
+    def cycle_label_mode(self):
+        """Label 按钮 / N 键：轴标注三模式循环 Freq → Note → Min。
+
+        - Freq：x 轴频率数字 + y 轴 dB 数字（默认）；
+        - Note：音名标注（详情模式垂直音名+音量数字；紧凑模式 x 轴音名替换频率数字）；
+        - Min：最简 —— 隐藏全部刻度数字（x/y 轴都不画），只留频谱与网格。
+        """
+        self.label_mode = (self.label_mode + 1) % 3
+        self.btn_label.setText(LABEL_MODE_TEXT[self.label_mode])
         self.update()
 
     def set_tint(self, value):
@@ -945,7 +965,8 @@ class SpectrumWindow(QWidget):
         self.btn_pause = self._make_btn("⏸", 28, self.toggle_pause)
         self.btn_dbrange = self._make_btn("dB", 30, self.reset_view)
         self.btn_scale = self._make_btn("Log", 40, self.toggle_scale)
-        self.btn_notes = self._make_btn("Notes", 46, self.toggle_notes)
+        self.btn_label = self._make_btn("Freq", 40, self.cycle_label_mode)
+        self.btn_label.setToolTip("轴标注循环：Freq 频率数字 → Note 音名 → Min 隐藏全部数字")
         self.btn_trans = self._make_btn("Trans", 46, self.toggle_transparent)
         self.btn_top = self._make_btn("Top", 40, self.toggle_always_on_top)
         self.btn_border = self._make_btn("Br", 32, self.toggle_border)
@@ -968,7 +989,7 @@ class SpectrumWindow(QWidget):
         self.height_slider.valueChanged.connect(self.set_window_height)
         self.toolbar_btns = [self.btn_rec, self.btn_clear, self.btn_dev,
                              self.btn_pause, self.btn_dbrange, self.btn_scale,
-                             self.btn_notes, self.btn_trans, self.btn_top,
+                             self.btn_label, self.btn_trans, self.btn_top,
                              self.btn_border, self.btn_hide, self.btn_reload]
         self._apply_slider_style()
         self._toolbar_visible = False
@@ -1116,7 +1137,7 @@ QSlider::handle:horizontal {{
         elif e.key() == Qt.Key.Key_L:
             self.toggle_scale()
         elif e.key() == Qt.Key.Key_N:
-            self.toggle_notes()
+            self.cycle_label_mode()
         elif e.key() == Qt.Key.Key_O:
             self.cycle_opacity()
         else:
@@ -1144,7 +1165,7 @@ QSlider::handle:horizontal {{
             if self.engine.recording:
                 color = TRACK_COLORS[len(self.engine.tracks) % len(TRACK_COLORS)]
                 self._draw_envelope(p, plot, self.engine.current_max, color, dashed=True)
-            if self.show_notes:
+            if self.label_mode == LABEL_NOTES:
                 self._draw_note_markers(p, plot)
                 # 紧凑模式：底部音名替代跟随曲线的音名（见 _draw_x_axis_notes）
                 if self.height() > HEIGHT_COMPACT:
@@ -1313,7 +1334,7 @@ QSlider::handle:horizontal {{
 
     def _static_key(self):
         """静态层状态签名：变化时才重建静态层。"""
-        return (self.width(), self.height(), self.log_scale, self.show_notes,
+        return (self.width(), self.height(), self.log_scale, self.label_mode,
                 self.transparent, self.show_border,
                 round(self.freq_lo, 1), round(self.freq_hi, 1),
                 round(self.db_lo, 1), round(self.db_hi, 1),
@@ -1490,13 +1511,13 @@ QSlider::handle:horizontal {{
             y = self._db_to_y(db, plot)
             y = max(plot.top(), min(plot.bottom(), y))
             disp = db_display(db)
-            # 紧凑模式 + notes 开：底部 x 轴音名在 plot.bottom 附近，重叠时让音名盖住音量数字（跳过绘制）
-            if self.height() <= HEIGHT_COMPACT and self.show_notes \
+            # 紧凑模式 + Note 模式：底部 x 轴音名在 plot.bottom 附近，重叠时让音名盖住音量数字（跳过绘制）
+            if self.height() <= HEIGHT_COMPACT and self.label_mode == LABEL_NOTES \
                     and y > plot.bottom() - NOTE_XAXIS_OVERLAP_PX:
                 continue
-            # 详情模式（>200px）+ notes 开：音名在 FR 下方 15px（trans 开）或顶行（trans 关），
+            # 详情模式（>200px）+ Note 模式：音名在 FR 下方 15px（trans 开）或顶行（trans 关），
             # 与音名重叠时让音名盖住音量数字（跳过绘制音量）
-            if self.height() > HEIGHT_COMPACT and self.show_notes:
+            if self.height() > HEIGHT_COMPACT and self.label_mode == LABEL_NOTES:
                 if self.transparent:
                     y_name = self._db_to_y(note_ref_db(f), plot) + NOTE_FR_OFFSET_PX
                 else:
@@ -1542,8 +1563,10 @@ QSlider::handle:horizontal {{
                        f"E{errs}")
 
     def _draw_x_axis(self, p, plot):
-        # 紧凑模式 + notes 开：x 轴频率数字替换为音名（去八度、顺时针旋转 90°）
-        if self.height() <= HEIGHT_COMPACT and self.show_notes:
+        if self.label_mode == LABEL_MIN:
+            return   # Min 模式：隐藏全部刻度数字
+        # 紧凑模式 + Note 模式：x 轴频率数字替换为音名（去八度、顺时针旋转 90°）
+        if self.height() <= HEIGHT_COMPACT and self.label_mode == LABEL_NOTES:
             self._draw_x_axis_notes(p, plot)
             return
         p.setFont(self.axis_font)
@@ -1567,7 +1590,7 @@ QSlider::handle:horizontal {{
             last_right = x + w / 2.0
 
     def _draw_x_axis_notes(self, p, plot):
-        """紧凑模式（≤200px）+ notes 开：x 轴每个半音都标注音名（去八度）。
+        """紧凑模式（≤200px）+ Note 模式：x 轴每个半音都标注音名（去八度）。
 
         正常水平书写（从左到右）；颜色沿用原刻度数字（theme.text）；G#6 → G#。
         """
@@ -1593,6 +1616,8 @@ QSlider::handle:horizontal {{
             last_right = x + w / 2.0
 
     def _draw_y_axis(self, p, plot):
+        if self.label_mode == LABEL_MIN:
+            return   # Min 模式：隐藏全部刻度数字
         p.setFont(self.axis_font)
         p.setPen(QPen(QColor(self.theme["text"])))
         for v in db_ticks(self.db_lo, self.db_hi):

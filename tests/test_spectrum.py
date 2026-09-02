@@ -1,13 +1,14 @@
 """纯逻辑层单测：刻度、格式化、dB 视口约束、缩放、频响基准、主题。"""
 import pytest
 
-from spectrum import (FR_REF_DB, MIDI_MAX, NOTE_FR_OFFSET_PX, _mix_white,
+from spectrum import (FR_REF_DB, LABEL_MIN, LABEL_MODE_TEXT, LABEL_NOTES,
+                      MIDI_MAX, NOTE_FR_OFFSET_PX, _mix_white,
                       THEMES, THEME_ORDER, adhere_step, clamp_db, db_display,
-                      db_ticks, ease_out_cubic, fine_freq_ticks, floor_baseline,
-                      format_freq, freq_to_midi, headphone_fr, lin_ticks, log_ticks,
-                      mode_anchor, mode_forced_preview, note_frequency, note_name,
-                      note_name_short, note_ref_db, should_follow_taskbar,
-                      zoom_db_view, zorder_insert)
+                      db_ticks, ease_out_cubic, filter_sources, fine_freq_ticks,
+                      floor_baseline, format_freq, freq_to_midi, headphone_fr,
+                      lin_ticks, log_ticks, mode_anchor, mode_forced_preview,
+                      note_frequency, note_name, note_name_short, note_ref_db,
+                      should_follow_taskbar, zoom_db_view, zorder_insert)
 
 
 def test_log_ticks_all_digits():
@@ -103,6 +104,14 @@ def test_note_extended_to_20k():
     assert note_frequency(MIDI_MAX) == pytest.approx(19912.13, rel=1e-3)
     assert note_frequency(MIDI_MAX) <= 20000
     assert note_frequency(MIDI_MAX + 1) > 20000
+
+
+def test_label_mode_constants():
+    """Label 按钮三模式循环：Freq → Note → Min（(mode+1)%3 为下一模式）。"""
+    assert LABEL_MODE_TEXT == ("Freq", "Note", "Min")
+    assert (0 + 1) % 3 == LABEL_NOTES      # Freq 的下一模式 = Note
+    assert (LABEL_NOTES + 1) % 3 == LABEL_MIN   # Note 的下一模式 = Min
+    assert (LABEL_MIN + 1) % 3 == 0        # Min 回到 Freq
 
 
 def test_mix_white():
@@ -231,3 +240,66 @@ def test_zorder_insert():
     # top 开 → HWND_TOPMOST(-1)；top 关 → HWND_BOTTOM(1) 真正最底
     assert zorder_insert(True) == -1
     assert zorder_insert(False) == 1
+
+
+# ---- filter_sources（Dev 信号源，2026-08-27）----
+
+def _fake_dev(name, max_input=2):
+    """虚拟 sounddevice 设备 dict（仅含 filter_sources 用到的字段）。"""
+    return {"name": name, "max_input_channels": max_input}
+
+
+def test_filter_sources_only_two_sources():
+    # Voicemeeter/CABLE/线路输入/非输入设备 → 全删，只剩 耳机输出 + 麦克风
+    devices = [
+        _fake_dev("Voicemeeter Out A1 (VB-Audio Voicemeeter VAIO)"),
+        _fake_dev("CABLE Output (VB-Audio Virtual Cable)"),
+        _fake_dev("立体声混音 (Realtek(R) Audio)"),
+        _fake_dev("立体声混音 (Realtek HD Audio Stereo input)"),
+        _fake_dev("麦克风 (UGREEN CM564 USB Audio)"),
+        _fake_dev("麦克风 (Realtek HD Audio Mic input)"),
+        _fake_dev("线路输入 (Realtek HD Audio Line input)"),
+        _fake_dev("扬声器 (Realtek(R) Audio)", max_input=0),   # 输出设备，非输入
+    ]
+    result = filter_sources(devices)
+    names = [d["name"] for _i, d in result]
+    assert names == ["立体声混音 (Realtek(R) Audio)", "麦克风 (UGREEN CM564 USB Audio)"]
+
+
+def test_filter_sources_prefers_main_mix():
+    # Realtek(R) 主混音排在后面也优先选中（删除 realtek 2nd / 其他混音）
+    devices = [
+        _fake_dev("立体声混音 (Realtek HD Audio Stereo input)"),
+        _fake_dev("立体声混音 (Realtek(R) Audio)"),
+        _fake_dev("麦克风 (UGREEN CM564 USB Audio)"),
+    ]
+    result = filter_sources(devices)
+    assert result[0][1]["name"] == "立体声混音 (Realtek(R) Audio)"
+
+
+def test_filter_sources_prefers_ugreen_mic():
+    # UGREEN USB 麦排在后面也优先选中（删除 Realtek 麦克风）
+    devices = [
+        _fake_dev("立体声混音 (Realtek(R) Audio)"),
+        _fake_dev("麦克风 (Realtek HD Audio Mic input)"),
+        _fake_dev("麦克风 (UGREEN CM564 USB Audio)"),
+    ]
+    result = filter_sources(devices)
+    assert result[1][1]["name"] == "麦克风 (UGREEN CM564 USB Audio)"
+
+
+def test_filter_sources_fallback_first_of_kind():
+    # 无 Realtek(R) 主混音 → 取第一个立体声混音；无 UGREEN → 取第一个麦克风
+    devices = [
+        _fake_dev("立体声混音 (Realtek HD Audio Stereo input)"),
+        _fake_dev("麦克风 (Realtek HD Audio Mic input)"),
+    ]
+    result = filter_sources(devices)
+    names = [d["name"] for _i, d in result]
+    assert names == ["立体声混音 (Realtek HD Audio Stereo input)",
+                     "麦克风 (Realtek HD Audio Mic input)"]
+
+
+def test_filter_sources_empty_when_no_match():
+    assert filter_sources([_fake_dev("Voicemeeter Out A1"), _fake_dev("CABLE Output")]) == []
+    assert filter_sources([_fake_dev("扬声器", max_input=0)]) == []
