@@ -1,14 +1,16 @@
 """纯逻辑层单测：刻度、格式化、dB 视口约束、缩放、频响基准、主题。"""
 import pytest
 
-from spectrum import (FR_REF_DB, LABEL_MIN, LABEL_MODE_TEXT, LABEL_NOTES,
-                      MIDI_MAX, NOTE_FR_OFFSET_PX, _mix_white,
+from spectrum import (EDGE_B, EDGE_L, EDGE_R, EDGE_T, FR_REF_DB, LABEL_MIN,
+                      LABEL_MODE_TEXT, LABEL_NOTES, MIDI_MAX, NOTE_FR_OFFSET_PX,
+                      PIP_COLORS, PIP_H, PIP_W, SPEED_PRESETS, _mix_white,
                       THEMES, THEME_ORDER, adhere_step, clamp_db, db_display,
                       db_ticks, ease_out_cubic, filter_sources, fine_freq_ticks,
                       floor_baseline, format_freq, freq_to_midi, headphone_fr,
                       lin_ticks, log_ticks, mode_anchor, mode_forced_preview,
                       note_frequency, note_name, note_name_short, note_ref_db,
-                      should_follow_taskbar, zoom_db_view, zorder_insert)
+                      pip_edge_at, pip_resize_geom, should_follow_taskbar,
+                      zoom_db_view, zorder_insert)
 
 
 def test_log_ticks_all_digits():
@@ -303,3 +305,82 @@ def test_filter_sources_fallback_first_of_kind():
 def test_filter_sources_empty_when_no_match():
     assert filter_sources([_fake_dev("Voicemeeter Out A1"), _fake_dev("CABLE Output")]) == []
     assert filter_sources([_fake_dev("扬声器", max_input=0)]) == []
+
+
+# ---- 画中画（PiP）：边缘命中 + 拖边缩放 ----
+
+def test_pip_constants_sane():
+    assert PIP_W == 500 and PIP_H == 25
+    assert len(PIP_COLORS) == len(set(PIP_COLORS))    # 基色板无重复
+
+
+def test_speed_presets_order():
+    # 档位顺序固定：Slow/Mid/Fast；SpectrumWindow 默认取下标 2（Fast）
+    assert [p[0] for p in SPEED_PRESETS] == ["Slow", "Mid", "Fast"]
+
+
+def test_pip_edge_at_center_is_zero():
+    # 内部（远离热区）不算边缘：500×25 的窗，x 6~494、y 6~19 才是"内部"
+    assert pip_edge_at(250, 12, 500, 25) == 0
+    assert pip_edge_at(10, 10, 25, 500) == 0
+
+
+def test_pip_edge_at_sides():
+    assert pip_edge_at(3, 250, 25, 500) & EDGE_L
+    assert pip_edge_at(22, 250, 25, 500) & EDGE_R
+    assert not pip_edge_at(3, 250, 25, 500) & EDGE_T
+
+
+def test_pip_edge_at_top_bottom():
+    assert pip_edge_at(12, 2, 200, 100) & EDGE_T
+    assert pip_edge_at(12, 97, 200, 100) & EDGE_B
+    assert not pip_edge_at(12, 50, 200, 100)
+
+
+def test_pip_edge_at_corner_combines_flags():
+    e = pip_edge_at(2, 2, 200, 100)
+    assert e == (EDGE_L | EDGE_T)
+    e = pip_edge_at(198, 98, 200, 100)
+    assert e == (EDGE_R | EDGE_B)
+
+
+def test_pip_resize_right_edge():
+    x, y, w, h = pip_resize_geom(EDGE_R, 100, 100, 25, 500, 75, 0)
+    assert (x, y) == (100, 100)
+    assert (w, h) == (100, 500)
+
+
+def test_pip_resize_left_edge_moves_x():
+    # 拖左边：x 右移、宽反向缩，右边缘不动（100+25=125 == 55+70）
+    x, y, w, h = pip_resize_geom(EDGE_L, 100, 100, 25, 500, -45, 0)
+    assert (x, w) == (55, 70)
+    assert x + w == 125
+
+
+def test_pip_resize_left_edge_min_clamp():
+    # 拖过头（左边缘向右推）：宽钳到最小 10，左边墙停住（光标下的边不再跟手）
+    x, y, w, h = pip_resize_geom(EDGE_L, 100, 100, 25, 500, 100, 0)
+    assert (x, w) == (115, 10)
+
+
+def test_pip_resize_left_edge_grow():
+    # 左边缘向左拖 = 窗口变宽，右边缘不动
+    x, y, w, h = pip_resize_geom(EDGE_L, 100, 100, 25, 500, -75, 0)
+    assert (x, w) == (25, 100)
+    assert x + w == 125
+
+
+def test_pip_resize_bottom_edge_min_clamp():
+    x, y, w, h = pip_resize_geom(EDGE_B, 0, 0, 25, 500, 0, -1000)
+    assert (x, y, w, h) == (0, 0, 25, 40)
+
+
+def test_pip_resize_top_edge():
+    x, y, w, h = pip_resize_geom(EDGE_T, 100, 100, 25, 500, 0, 50)
+    assert (y, h) == (150, 450)
+    assert y + h == 600            # 底边不动（100+500=600）
+
+
+def test_pip_resize_corner():
+    x, y, w, h = pip_resize_geom(EDGE_L | EDGE_B, 100, 100, 25, 500, -25, 100)
+    assert (x, y, w, h) == (75, 100, 50, 600)

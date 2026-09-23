@@ -22,6 +22,12 @@ matplotlib 只能 ~30 FPS，换 PyQt6 自绘可到 180 FPS 平滑；黑底、极
     O                 = 循环窗口透明度（100/70/50/25%，默认 25%）
     Esc               = 退出
 
+画中画（PiP，dock 工具条 PiP 按钮）:
+    PiP 按钮          = 频谱弹成无边框置顶小窗（默认 500×25，只显示折线），主窗隐藏
+    拖小窗边缘/角落    = 改大小；拖内部 = 移动
+    P / Esc（小窗内） = 切回主窗
+    C（小窗内）       = 循环小窗主题色（只影响小窗，主窗配色不动）
+
 工具条（dock，悬停底部弹出）:
     Trans 关 = 实底模式，内容透明度自动变 85%（开时恢复原值，默认 25%；dock/折线恒不透明）
     Hide    = 隐藏 dock 10 秒（期间悬停底部也不弹出）
@@ -67,7 +73,7 @@ import sounddevice as sd
 from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer
 from PyQt6.QtGui import (QBrush, QColor, QCursor, QFont, QFontDatabase, QIcon,
                          QLinearGradient, QPainter, QPen, QPixmap, QPolygonF)
-from PyQt6.QtWidgets import QApplication, QPushButton, QSlider, QWidget
+from PyQt6.QtWidgets import QApplication, QColorDialog, QPushButton, QSlider, QWidget
 
 # ---- 常量 ----
 SAMPLERATE = 48000
@@ -127,12 +133,51 @@ QPushButton:pressed { background: #a3262b; }
 # ---- 主题（皮肤）----
 THEMES = {
     "sunset": {"bg": "#12090d", "line_bottom": "#4a1f30", "line_top": "#BD5075",
-               "grid": "#2a141e", "text": "#8a5a6b", "border": "#1a0d12"},
+               "fine": "#F096B9", "grid": "#2a141e", "text": "#8a5a6b", "border": "#1a0d12"},
 }
 THEME_ORDER = list(THEMES.keys())
 
-# 包络轨道配色（多段异色对比，3 条够用）
+# 包络轨道配色（多段异色对比，3 条够用）；默认组（未自选主题色时）
 TRACK_COLORS = ["#ff4d4d", "#ffd23f", "#3ddc84"]
+N_TRACK_SERIES = len(TRACK_COLORS)
+
+# 采样密度（折线归并列宽 px，越小越细密）；默认 2 = 原行为
+DENSITY_COL_W = [1.0, 2.0, 4.0, 8.0]
+
+# 动态速度档位：缩放 Attack/Release（上升/下降权重）→ 曲线延迟感（慢=更平滑滞后，快=更跟手）
+SPEED_PRESETS = [("Slow", 0.45, 0.10), ("Mid", ATTACK, RELEASE), ("Fast", 0.95, 0.55)]
+
+# 屏幕/整体缩放档位：窗口尺寸 + 字体 + 工具条一起缩（1K 屏选 50%）
+UI_SCALES = [("100%", 1.0), ("2K 75%", 0.75), ("1K 50%", 0.5)]
+BASE_WINDOW_WIDTH = 2560
+
+
+def _palette_from_base(base):
+    """从一个主题色生成整套配色：上下渐变、精细参考线、网格、文字、边框、背景（同色系）。"""
+    h, s, v, _a = base.getHsvF()
+    h = h if h >= 0 else 0.0
+    s = min(1.0, s) if s >= 0 else 0.5
+    v = min(1.0, v) if v >= 0 else 0.8
+
+    def hx(hh, ss, vv):
+        return QColor.fromHsvF(hh % 1.0, min(1.0, max(0.0, ss)),
+                               min(1.0, max(0.0, vv))).name()
+    return {
+        "line_top": base.name(),
+        "line_bottom": hx(h, s * 1.1, v * 0.35),
+        "fine": hx(h + 0.08, s * 0.8, min(1.0, v * 1.1 + 0.15)),
+        "grid": hx(h, 0.45, 0.18),
+        "text": hx(h, 0.30, 0.55),
+        "border": hx(h, 0.45, 0.10),
+        "bg": hx(h, 0.45, 0.07),
+    }
+
+
+def _track_series_from_base(base, n=N_TRACK_SERIES):
+    """轨道对比色：以主题色为起点沿色相环等距取 n 个高饱和色。"""
+    h, s, v, _a = base.getHsvF()
+    h = h if h >= 0 else 0.0
+    return [QColor.fromHsvF((h + i / n) % 1.0, 0.85, 0.95).name() for i in range(n)]
 
 # 内容透明度预设（O 循环档位；折线/坐标数字/dock 恒不透明；默认 25%）
 OPACITY_PRESETS = [1.0, 0.70, 0.50, 0.25]
@@ -382,6 +427,55 @@ def zorder_insert(always_on_top):
     return -1 if always_on_top else 1
 
 
+# ---- 画中画（PiP，dock 按钮弹出只显示折线的无边框小窗）----
+PIP_W, PIP_H = 500, 25               # 默认尺寸 500×25（横向细条，拖边缘/角落可改大小）
+PIP_EDGE = 6                         # 边缘热区 px（光标进入变 resize 形状）
+PIP_MIN_W, PIP_MIN_H = 10, 40        # resize 尺寸下限
+PIP_BG_ALPHA = 217                   # PiP 背景不透明度（弱背景衬托折线，仍微透桌面）
+PIP_FILL_OPACITY = 0.85              # 折线下方渐变填充透明度（折线本身恒不透明）
+PIP_COLORS = ["#BD5075", "#4FC3F7", "#3DDC84", "#FFD23F",
+              "#FF7043", "#9575CD", "#F06292", "#26C6DA"]   # C 键循环的基色板
+
+# 边缘 bitmask：左/右/水平、上/下/垂直、四角叠加两标志
+EDGE_L, EDGE_R, EDGE_T, EDGE_B = 1, 2, 4, 8
+
+
+def pip_edge_at(x, y, w, h, margin=PIP_EDGE):
+    """PiP 窗口内坐标 (x, y) → 边缘热区 bitmask（角落同时含两个标志；内部返回 0）。"""
+    e = 0
+    if x <= margin:
+        e |= EDGE_L
+    elif x >= w - margin:
+        e |= EDGE_R
+    if y <= margin:
+        e |= EDGE_T
+    elif y >= h - margin:
+        e |= EDGE_B
+    return e
+
+
+def pip_resize_geom(edge, x, y, w, h, dx, dy, min_w=PIP_MIN_W, min_h=PIP_MIN_H):
+    """按边缘 bitmask 应用拖动位移 (dx, dy) → 新 (x, y, w, h)。
+
+    拖右/下边改宽高（钳最小值）；拖左/上边移动 x/y 并反向缩（推到最小尺寸后墙停），
+    保证拖动期间光标下的边缘始终跟手。
+    """
+    x, y, w, h = float(x), float(y), float(w), float(h)
+    if edge & EDGE_L:
+        nx = min(x + dx, x + w - min_w)
+        w -= nx - x
+        x = nx
+    if edge & EDGE_R:
+        w = max(min_w, w + dx)
+    if edge & EDGE_T:
+        ny = min(y + dy, y + h - min_h)
+        h -= ny - y
+        y = ny
+    if edge & EDGE_B:
+        h = max(min_h, h + dy)
+    return int(round(x)), int(round(y)), int(round(w)), int(round(h))
+
+
 def filter_sources(devices):
     """Dev 信号源筛选（2026-08-27）：只保留 耳机输出（立体声混音）与 麦克风输入，其余通道不入循环。
 
@@ -540,7 +634,113 @@ class SpectrumEngine:
 
 # ---- 无边框窗口 ----
 
-class SpectrumWindow(QWidget):
+class SpectrumProjectionMixin:
+    """频率/dB → 屏幕坐标投影与折线绘制（主窗与 PiP 小窗共用）。
+
+    约定子类需提供属性：freq_lo/freq_hi、db_lo/db_hi、log_scale、density_idx、
+    tint、theme、engine、_proj_cache。
+    """
+
+    def _freq_to_x(self, freq, plot):
+        # np.log10 对标量与数组都安全（_draw_fr_region 传 numpy 数组进来）
+        if self.log_scale:
+            frac = ((np.log10(freq) - np.log10(self.freq_lo)) /
+                    (np.log10(self.freq_hi) - np.log10(self.freq_lo)))
+        else:
+            frac = (freq - self.freq_lo) / (self.freq_hi - self.freq_lo)
+        return plot.left() + frac * plot.width()
+
+    def _db_to_y(self, db, plot):
+        frac = (db - self.db_lo) / (self.db_hi - self.db_lo)
+        return plot.bottom() - frac * plot.height()
+
+    def _projection(self, plot, freqs=None, freqs_log10=None):
+        """缓存：可见 bin 范围 + 每 bin 的 x 位置（按 plot 状态 × 频率网格键控）。
+
+        freqs=None 时用实时网格（engine.freqs）；传录制网格则用其 log10。
+        """
+        if freqs is None:
+            freqs = self.engine.freqs
+            freqs_log10 = self.engine.freqs_log10
+        key = (plot.left(), plot.top(), plot.width(), plot.height(),
+               self.freq_lo, self.freq_hi, self.log_scale, id(freqs))
+        cached = self._proj_cache.get(key)
+        if cached is not None:
+            return cached
+        lo = max(1, int(np.searchsorted(freqs, self.freq_lo)) - 1)
+        hi = min(len(freqs), int(np.searchsorted(freqs, self.freq_hi, side="right")) + 1)
+        if self.log_scale:
+            log_lo = math.log10(self.freq_lo)
+            log_range = math.log10(self.freq_hi) - log_lo
+            xs_full = plot.left() + (freqs_log10[lo:hi] - log_lo) / log_range * plot.width()
+        else:
+            xs_full = plot.left() + (freqs[lo:hi] - self.freq_lo) / (self.freq_hi - self.freq_lo) * plot.width()
+        self._proj_cache[key] = (key, lo, hi, xs_full)
+        return self._proj_cache[key]
+
+    def _bin_polygon(self, db_array, plot, freqs=None, freqs_log10=None):
+        """把 dB 数组映射为 plot 内的折线点（全频段 2px 一列取 max）。
+
+        freqs/freqs_log10=None 时用实时网格；录制包络传 engine.rec_freqs 网格。
+        """
+        _key, lo, hi, xs_full = self._projection(plot, freqs, freqs_log10)
+        if hi - lo < 2:
+            return []
+        v = db_array[lo:hi]
+        frac = np.clip((v - self.db_lo) / (self.db_hi - self.db_lo), 0.0, 1.0)
+        xs = xs_full
+        x_4k = self._freq_to_x(4000.0, plot)
+        col_w = DENSITY_COL_W[self.density_idx]
+        low = xs < x_4k
+        xs_low, fr_low = self._reduce_cols(xs[low], frac[low], plot, col_w)
+        xs_high, fr_high = self._reduce_cols(xs[~low], frac[~low], plot, col_w)
+        xs_out = np.concatenate([xs_low, xs_high])
+        fr_out = np.concatenate([fr_low, fr_high])
+        order = np.argsort(xs_out)
+        xs_out = xs_out[order]
+        fr_out = fr_out[order]
+        # 信号低于可视区（音量不足）时，底线保留在显示区底部 1px 内，曲线不消失
+        ys_out = floor_baseline(plot.bottom() - fr_out * plot.height(), plot.bottom())
+        return [QPointF(float(x), float(y)) for x, y in zip(xs_out, ys_out)]
+
+    def _reduce_cols(self, xs, frac, plot, col_w):
+        """按 col_w 像素一列归并 (xs, frac)，列内取 max 保峰。"""
+        if len(xs) == 0:
+            return np.array([]), np.array([])
+        ncols = int(plot.width() / col_w) + 1
+        col = np.clip(np.floor((xs - plot.left()) / col_w).astype(np.intp), 0, ncols - 1)
+        fr_cols = np.full(ncols, -1.0)
+        np.maximum.at(fr_cols, col, frac)
+        mask = fr_cols >= 0.0
+        return plot.left() + np.arange(ncols)[mask] * col_w + col_w / 2.0, fr_cols[mask]
+
+    def _draw_spectrum(self, p, plot):
+        pts = self._bin_polygon(self.engine.current, plot)
+        if len(pts) < 2:
+            return
+
+        # 渐变填充（曲线下方）：白色 tint 只作用于这个色块；跟随原生透明度
+        t = self.tint / 100.0
+        fill = QPolygonF(pts)
+        fill.append(QPointF(plot.right(), plot.bottom()))
+        fill.append(QPointF(plot.left(), plot.bottom()))
+        grad = QLinearGradient(0, plot.bottom(), 0, plot.top())
+        grad.setColorAt(0.0, QColor(_mix_white(self.theme["line_bottom"], t)))
+        grad.setColorAt(1.0, QColor(_mix_white(self.theme["line_top"], t)))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(grad))
+        p.drawPolygon(fill)
+
+        # 折线：恒不透明（豁免原生透明度；不受 tint 影响）
+        p.save()
+        p.setOpacity(1.0)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(self.theme["line_top"]), 1.5))
+        p.drawPolyline(QPolygonF(pts))
+        p.restore()
+
+
+class SpectrumWindow(SpectrumProjectionMixin, QWidget):
     def __init__(self, engine, config_path=None, device=None):
         super().__init__()
         self.engine = engine
@@ -549,6 +749,13 @@ class SpectrumWindow(QWidget):
         self.theme_name = THEME_ORDER[0]
         self.theme = dict(THEMES[self.theme_name])
         self.tint = DEFAULT_TINT
+        self.density_idx = 1                # 采样密度档（默认 2px 列宽 = 原行为）
+        self.speed_idx = 2                  # 动态速度档（默认 Fast 跟手）
+        _spd_name, _spd_a, _spd_r = SPEED_PRESETS[self.speed_idx]
+        self.engine.attack, self.engine.release = _spd_a, _spd_r
+        self.ui_scale_idx = 0               # 屏幕缩放档
+        self.ui_scale = 1.0
+        self.track_colors = list(TRACK_COLORS)   # 轨道配色（选主题色后重新生成）
         self.always_on_top = True    # 默认置顶（2026-08-18）
         self.transparent = True
         self.show_border = False             # 左/下/右边框显示开关（工具栏 Br 切换）；默认无边框
@@ -558,6 +765,8 @@ class SpectrumWindow(QWidget):
         self._last_topmost_assert = 0.0      # 上次重申置顶时间（盖任务栏模式防任务栏压过）
         self._adhere_last_top = None         # 贴任务栏：上次轮询的任务栏上沿 y（运动检测，None=未初始化）
         self._adhere_anim = None             # 贴任务栏：进行中的固定动画 {y0, y1, t0, dur}
+        self._pip = None                     # 画中画小窗（PiP 按钮创建；P/Esc 切回后置 None）
+        self._dock_half_w = 500.0            # dock 交互/背景半宽（随按钮总宽自适应，≥500）
 
         self.freq_lo, self.freq_hi = FREQ_MIN, FREQ_MAX
         self.db_lo, self.db_hi = DB_LO, DB_HI
@@ -802,6 +1011,61 @@ class SpectrumWindow(QWidget):
             self.theme = dict(THEMES[key])
             self._apply_slider_style()
 
+    def apply_base_color(self, color):
+        """主题色：从一个颜色生成整套同色系配色（渐变/精细线/网格/轨道对比色）。"""
+        self.theme.update(_palette_from_base(color))
+        self.track_colors = _track_series_from_base(color)
+        self._apply_slider_style()
+        self._static_key_cached = None      # 强制重建静态层（key 含主题色，正常也会触发）
+        self.update()
+
+    def pick_color(self):
+        col = QColorDialog.getColor(QColor(self.theme["line_top"]), self, "选择主题色")
+        if col.isValid():
+            self.apply_base_color(col)
+
+    def cycle_density(self):
+        """采样密度：折线归并列宽 1/2/4/8 px，越小越细密（点越多）。"""
+        self.density_idx = (self.density_idx + 1) % len(DENSITY_COL_W)
+        self.btn_density.setText(f"D{DENSITY_COL_W[self.density_idx]:.0f}")
+        self.update()
+
+    def cycle_speed(self):
+        """动态速度：缩放 Attack/Release → 慢（平滑滞后）/ 中 / 快（跟手）。"""
+        self.speed_idx = (self.speed_idx + 1) % len(SPEED_PRESETS)
+        name, a, r = SPEED_PRESETS[self.speed_idx]
+        self.engine.attack, self.engine.release = a, r
+        self.btn_speed.setText(f"Spd:{name}")
+
+    def cycle_ui_scale(self):
+        """屏幕缩放：窗口宽度/高度、字体、工具条整体缩放（1K 屏选 50%）。"""
+        self.ui_scale_idx = (self.ui_scale_idx + 1) % len(UI_SCALES)
+        name, s = UI_SCALES[self.ui_scale_idx]
+        self.apply_ui_scale(s, name)
+
+    def apply_ui_scale(self, s, name=None):
+        old = self.ui_scale
+        self.ui_scale = s
+        # 窗口：宽高按档位比例缩放，底边锚定不动
+        new_w = max(320, round(BASE_WINDOW_WIDTH * s))
+        new_h = max(40, round(self.height() * s / old))
+        self.setGeometry(self.x(), self.y() + self.height() - new_h, new_w, new_h)
+        # 字体
+        fs = max(6, round(8 * s))
+        self.axis_font = _pick_font(fs)
+        self.note_font = _pick_font(fs)
+        # 工具条按钮 + 滑块
+        for btn in self.toolbar_btns + [self.btn_close]:
+            btn.setFixedSize(round(btn._base_w * s), round(20 * s))
+            btn.setStyleSheet(btn._base_style.replace("11px", f"{round(11 * s)}px"))
+        self.tint_slider.setFixedSize(round(120 * s), round(20 * s))
+        self.height_slider.setFixedSize(round(90 * s), round(20 * s))
+        self._proj_cache = {}
+        self._static_key_cached = None
+        self._layout_toolbar()
+        if name:
+            self.btn_scale_ui.setText(name)
+
     # ---- 工具条动作 ----
     def cycle_device(self):
         if not self.input_devices:
@@ -902,6 +1166,19 @@ class SpectrumWindow(QWidget):
         self._set_toolbar_visible(False)
         self._set_click_through(True)
 
+    def open_pip(self):
+        """PiP 按钮：把频谱弹成画中画小窗（只显示折线），主窗隐藏。
+
+        小窗内 P/Esc = 切回（关闭小窗、恢复主窗），C = 换小窗主题色（不影响主窗）。
+        """
+        if self._pip is not None:
+            return
+        self._pip = PipWindow(self)
+        self._pip.show()
+        hwnd = int(self._pip.winId())
+        user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x2 | 0x1 | 0x10)  # TOPMOST
+        self.hide()
+
     def toggle_always_on_top(self):
         """Top：置顶开关。
         联动（2026-08-20 优化）：无论开/关，切 top 时 trans 自动关闭（转实底）；
@@ -975,6 +1252,17 @@ class SpectrumWindow(QWidget):
         self.btn_hide.customContextMenuRequested.connect(self.hide_dock_forever)
         self.btn_hide.setToolTip("左键隐藏 10s / 右键隐藏至下次启动")
         self.btn_reload = self._make_btn("⟳", 28, self.reload_config)
+        self.btn_density = self._make_btn("D2", 32, self.cycle_density)
+        self.btn_density.setToolTip("采样密度：折线归并列宽 1/2/4/8 px（越小越细密）")
+        self.btn_speed = self._make_btn(f"Spd:{SPEED_PRESETS[self.speed_idx][0]}",
+                                        56, self.cycle_speed)
+        self.btn_speed.setToolTip("动态速度：慢（平滑滞后）/ 中 / 快（跟手）")
+        self.btn_pip = self._make_btn("PiP", 38, self.open_pip)
+        self.btn_pip.setToolTip("画中画：弹出无边框小窗只显示折线（P/Esc 切回，C 换小窗主题色）")
+        self.btn_color = self._make_btn("🎨", 32, self.pick_color)
+        self.btn_color.setToolTip("主题色：选一个颜色自动生成整套同色系配色")
+        self.btn_scale_ui = self._make_btn("100%", 44, self.cycle_ui_scale)
+        self.btn_scale_ui.setToolTip("屏幕缩放：100% / 2K 75% / 1K 50%（窗口+字体+工具条整体缩放）")
         self.tint_slider = QSlider(Qt.Orientation.Horizontal, self)
         self.tint_slider.setRange(0, 100)
         self.tint_slider.setValue(self.tint)
@@ -990,7 +1278,9 @@ class SpectrumWindow(QWidget):
         self.toolbar_btns = [self.btn_rec, self.btn_clear, self.btn_dev,
                              self.btn_pause, self.btn_dbrange, self.btn_scale,
                              self.btn_label, self.btn_trans, self.btn_top,
-                             self.btn_border, self.btn_hide, self.btn_reload]
+                             self.btn_border, self.btn_hide, self.btn_reload,
+                             self.btn_density, self.btn_speed, self.btn_pip,
+                             self.btn_color, self.btn_scale_ui]
         self._apply_slider_style()
         self._toolbar_visible = False
         self._set_toolbar_visible(False)
@@ -1008,9 +1298,11 @@ class SpectrumWindow(QWidget):
 
     def _make_btn(self, text, width, slot, style=BTN_STYLE):
         btn = QPushButton(text, self)
+        btn._base_w = width
+        btn._base_style = style
         btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        btn.setFixedSize(width, 20)
-        btn.setStyleSheet(style)
+        btn.setFixedSize(round(width * self.ui_scale), round(20 * self.ui_scale))
+        btn.setStyleSheet(style.replace("11px", f"{round(11 * self.ui_scale)}px"))
         btn.clicked.connect(slot)
         return btn
 
@@ -1082,6 +1374,8 @@ QSlider::handle:horizontal {{
         items = list(self.toolbar_btns) + [self.tint_slider, self.height_slider,
                                            self.btn_close]
         total = sum(w.width() for w in items) + 6 * (len(items) - 1)
+        # dock 背景条与悬停热区随按钮总宽自适应（保证所有按钮都在背景内、可交互）
+        self._dock_half_w = max(500.0, total / 2.0 + 8)
         x = (self.width() - total) // 2
         for btn in self.toolbar_btns:
             btn.move(x, y)
@@ -1099,7 +1393,7 @@ QSlider::handle:horizontal {{
     def _in_toolbar_zone(self, pos):
         if pos.y() < self.height() - 60:
             return False
-        return abs(pos.x() - self.width() / 2.0) <= 500
+        return abs(pos.x() - self.width() / 2.0) <= self._dock_half_w
 
     # ---- 事件 ----
     def mousePressEvent(self, e):
@@ -1140,12 +1434,26 @@ QSlider::handle:horizontal {{
             self.cycle_label_mode()
         elif e.key() == Qt.Key.Key_O:
             self.cycle_opacity()
+        elif e.key() == Qt.Key.Key_D:
+            self.cycle_density()
+        elif e.key() == Qt.Key.Key_S:
+            self.cycle_speed()
+        elif e.key() == Qt.Key.Key_P:
+            self.pick_color()
+        elif e.key() == Qt.Key.Key_G:
+            self.cycle_ui_scale()
         else:
             super().keyPressEvent(e)
 
     def resizeEvent(self, e):
         self._layout_toolbar()
         super().resizeEvent(e)
+
+    def closeEvent(self, e):
+        # Esc 退出时若画中画还开着，一并关闭（否则 Qt.Tool 小窗可能让进程残留）
+        if self._pip is not None:
+            self._pip.close()
+        super().closeEvent(e)
 
     # ---- 绘制 ----
     def paintEvent(self, event):
@@ -1163,7 +1471,7 @@ QSlider::handle:horizontal {{
             self._draw_spectrum(p, plot)
             self._draw_fine_ref(p, plot)
             if self.engine.recording:
-                color = TRACK_COLORS[len(self.engine.tracks) % len(TRACK_COLORS)]
+                color = self.track_colors[len(self.engine.tracks) % len(self.track_colors)]
                 self._draw_envelope(p, plot, self.engine.current_max, color, dashed=True)
             if self.label_mode == LABEL_NOTES:
                 self._draw_note_markers(p, plot)
@@ -1180,7 +1488,8 @@ QSlider::handle:horizontal {{
         if self._toolbar_visible:
             dy = self._dock_y()
             cx = self.width() / 2.0
-            p.fillRect(QRectF(cx - 500, dy - 4, 1000, 30), QColor(18, 9, 13, 255))
+            p.fillRect(QRectF(cx - self._dock_half_w, dy - 4, self._dock_half_w * 2, 30),
+                       QColor(18, 9, 13, 255))
         if self.engine.recording:
             self._draw_rec_indicator(p)
         if self._toolbar_visible:
@@ -1195,19 +1504,6 @@ QSlider::handle:horizontal {{
         w = self.width() - 2 * m
         h = self.height() - 2 * m
         return QRectF(x, y, max(0, w), max(0, h))
-
-    def _freq_to_x(self, freq, plot):
-        # np.log10 对标量与数组都安全（_draw_fr_region 传 numpy 数组进来）
-        if self.log_scale:
-            frac = ((np.log10(freq) - np.log10(self.freq_lo)) /
-                    (np.log10(self.freq_hi) - np.log10(self.freq_lo)))
-        else:
-            frac = (freq - self.freq_lo) / (self.freq_hi - self.freq_lo)
-        return plot.left() + frac * plot.width()
-
-    def _db_to_y(self, db, plot):
-        frac = (db - self.db_lo) / (self.db_hi - self.db_lo)
-        return plot.bottom() - frac * plot.height()
 
     def _draw_grid(self, p, plot):
         p.setPen(QPen(QColor(self.theme["grid"]), 1))
@@ -1231,65 +1527,6 @@ QSlider::handle:horizontal {{
             y = self._db_to_y(v, plot)
             p.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y))
 
-    def _projection(self, plot, freqs=None, freqs_log10=None):
-        """缓存：可见 bin 范围 + 每 bin 的 x 位置（按 plot 状态 × 频率网格键控）。
-
-        freqs=None 时用实时网格（engine.freqs）；传录制网格则用其 log10。
-        """
-        if freqs is None:
-            freqs = self.engine.freqs
-            freqs_log10 = self.engine.freqs_log10
-        key = (plot.left(), plot.top(), plot.width(), plot.height(),
-               self.freq_lo, self.freq_hi, self.log_scale, id(freqs))
-        cached = self._proj_cache.get(key)
-        if cached is not None:
-            return cached
-        lo = max(1, int(np.searchsorted(freqs, self.freq_lo)) - 1)
-        hi = min(len(freqs), int(np.searchsorted(freqs, self.freq_hi, side="right")) + 1)
-        if self.log_scale:
-            log_lo = math.log10(self.freq_lo)
-            log_range = math.log10(self.freq_hi) - log_lo
-            xs_full = plot.left() + (freqs_log10[lo:hi] - log_lo) / log_range * plot.width()
-        else:
-            xs_full = plot.left() + (freqs[lo:hi] - self.freq_lo) / (self.freq_hi - self.freq_lo) * plot.width()
-        self._proj_cache[key] = (key, lo, hi, xs_full)
-        return self._proj_cache[key]
-
-    def _bin_polygon(self, db_array, plot, freqs=None, freqs_log10=None):
-        """把 dB 数组映射为 plot 内的折线点（全频段 2px 一列取 max）。
-
-        freqs/freqs_log10=None 时用实时网格；录制包络传 engine.rec_freqs 网格。
-        """
-        _key, lo, hi, xs_full = self._projection(plot, freqs, freqs_log10)
-        if hi - lo < 2:
-            return []
-        v = db_array[lo:hi]
-        frac = np.clip((v - self.db_lo) / (self.db_hi - self.db_lo), 0.0, 1.0)
-        xs = xs_full
-        x_4k = self._freq_to_x(4000.0, plot)
-        low = xs < x_4k
-        xs_low, fr_low = self._reduce_cols(xs[low], frac[low], plot, 2.0)
-        xs_high, fr_high = self._reduce_cols(xs[~low], frac[~low], plot, 2.0)
-        xs_out = np.concatenate([xs_low, xs_high])
-        fr_out = np.concatenate([fr_low, fr_high])
-        order = np.argsort(xs_out)
-        xs_out = xs_out[order]
-        fr_out = fr_out[order]
-        # 信号低于可视区（音量不足）时，底线保留在显示区底部 1px 内，曲线不消失
-        ys_out = floor_baseline(plot.bottom() - fr_out * plot.height(), plot.bottom())
-        return [QPointF(float(x), float(y)) for x, y in zip(xs_out, ys_out)]
-
-    def _reduce_cols(self, xs, frac, plot, col_w):
-        """按 col_w 像素一列归并 (xs, frac)，列内取 max 保峰。"""
-        if len(xs) == 0:
-            return np.array([]), np.array([])
-        ncols = int(plot.width() / col_w) + 1
-        col = np.clip(np.floor((xs - plot.left()) / col_w).astype(np.intp), 0, ncols - 1)
-        fr_cols = np.full(ncols, -1.0)
-        np.maximum.at(fr_cols, col, frac)
-        mask = fr_cols >= 0.0
-        return plot.left() + np.arange(ncols)[mask] * col_w + col_w / 2.0, fr_cols[mask]
-
     def _draw_fine_ref(self, p, plot):
         """精细参考线：长窗低频频谱（20-500Hz）叠加在实时主线之上，显示低频真实频率结构。
 
@@ -1304,33 +1541,10 @@ QSlider::handle:horizontal {{
         if len(pts) < 2:
             return
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(QColor(240, 150, 185, 128), 1.5))
+        fine_col = QColor(self.theme["fine"])
+        fine_col.setAlpha(128)
+        p.setPen(QPen(fine_col, 1.5))
         p.drawPolyline(QPolygonF(pts))
-
-    def _draw_spectrum(self, p, plot):
-        pts = self._bin_polygon(self.engine.current, plot)
-        if len(pts) < 2:
-            return
-
-        # 渐变填充（曲线下方）：白色 tint 只作用于这个色块；跟随原生透明度
-        t = self.tint / 100.0
-        fill = QPolygonF(pts)
-        fill.append(QPointF(plot.right(), plot.bottom()))
-        fill.append(QPointF(plot.left(), plot.bottom()))
-        grad = QLinearGradient(0, plot.bottom(), 0, plot.top())
-        grad.setColorAt(0.0, QColor(_mix_white(self.theme["line_bottom"], t)))
-        grad.setColorAt(1.0, QColor(_mix_white(self.theme["line_top"], t)))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(grad))
-        p.drawPolygon(fill)
-
-        # 折线：恒不透明（豁免原生透明度；不受 tint 影响）
-        p.save()
-        p.setOpacity(1.0)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(QColor(self.theme["line_top"]), 1.5))
-        p.drawPolyline(QPolygonF(pts))
-        p.restore()
 
     def _static_key(self):
         """静态层状态签名：变化时才重建静态层。"""
@@ -1340,7 +1554,8 @@ QSlider::handle:horizontal {{
                 round(self.db_lo, 1), round(self.db_hi, 1),
                 len(self.engine.tracks),
                 self.theme["bg"], self.theme["line_bottom"], self.theme["line_top"],
-                self.theme["grid"], self.theme["text"], self.theme["border"])
+                self.theme["grid"], self.theme["text"], self.theme["border"],
+                tuple(self.track_colors))
 
     def _draw_fr_region(self, p, plot):
         """透明模式：填充耳机素质曲线（HD490 Pro 参考）以下，并画出分隔曲线。"""
@@ -1403,7 +1618,7 @@ QSlider::handle:horizontal {{
         if plot.width() > 0 and plot.height() > 0:
             for i, trk in enumerate(self.engine.tracks):
                 self._draw_envelope(p, plot, trk,
-                                    TRACK_COLORS[i % len(TRACK_COLORS)], dashed=False)
+                                    self.track_colors[i % len(self.track_colors)], dashed=False)
             self._draw_legend(p, plot)
         p.setPen(QPen(QColor(self.theme["border"]), BORDER))
         p.setBrush(Qt.BrushStyle.NoBrush)
@@ -1453,7 +1668,7 @@ QSlider::handle:horizontal {{
         x = plot.right() - 56
         y = plot.top() + 12
         for i in range(len(self.engine.tracks)):
-            color = TRACK_COLORS[i % len(TRACK_COLORS)]
+            color = self.track_colors[i % len(self.track_colors)]
             p.setPen(QPen(QColor(color), 2))
             p.drawLine(QPointF(x, y), QPointF(x + 16, y))
             p.setPen(QPen(QColor(self.theme["text"])))
@@ -1641,6 +1856,148 @@ def _pick_font(point_size):
         if name in families:
             return QFont(name, point_size)
     return QFont("Segoe UI", point_size)
+
+
+# ---- 画中画小窗（PiP）----
+
+def _pip_cursor_shape(edge):
+    """边缘 bitmask → resize 光标形状（0 = 正常箭头）。"""
+    if edge == 0:
+        return Qt.CursorShape.ArrowCursor
+    if edge in (EDGE_L, EDGE_R):
+        return Qt.CursorShape.SizeHorCursor
+    if edge in (EDGE_T, EDGE_B):
+        return Qt.CursorShape.SizeVerCursor
+    if edge in (EDGE_L | EDGE_T, EDGE_R | EDGE_B):
+        return Qt.CursorShape.SizeFDiagCursor
+    return Qt.CursorShape.SizeBDiagCursor
+
+
+class PipWindow(SpectrumProjectionMixin, QWidget):
+    """画中画：只画折线（渐变填充 + 描边）的无边框置顶小窗。
+
+    - P / Esc = 切回主窗（关闭本窗并恢复主窗显示，closeEvent 统一处理）
+    - C       = 循环本窗主题色（基色板轮转 + 同色系整套配色；主窗配色不动）
+    - 内部拖动 = 移动窗口；边缘/角落拖动 = 改大小（pip_resize_geom）
+    视图参数（频率/dB 视口、log/lin、tint）在打开瞬间从主窗快照，主窗隐藏期间保持不变；
+    数据仍来自同一个 SpectrumEngine（主窗 advance() 隐藏时继续平滑 engine.current）。
+    """
+
+    def __init__(self, main):
+        super().__init__(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.WindowStaysOnTopHint)
+        self.main = main
+        self.engine = main.engine
+        self._proj_cache = {}
+        self.freq_lo, self.freq_hi = main.freq_lo, main.freq_hi
+        self.db_lo, self.db_hi = main.db_lo, main.db_hi
+        self.log_scale = main.log_scale
+        self.density_idx = 0                    # 窄窗用最细列宽（1px），小尺寸也有形状
+        self.tint = main.tint
+        self.theme = dict(main.theme)           # 从主窗当前配色出发；C 只改这份副本
+        cur = self.theme["line_top"].lower()
+        self._color_idx = next((i for i, c in enumerate(PIP_COLORS)
+                                if c.lower() == cur), -1)
+
+        self.setWindowTitle("Spectrum PiP")
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setMouseTracking(True)
+        self.resize(PIP_W, PIP_H)
+        self._move_default()
+        self._resize_mode = 0                   # 正在拖的边缘 bitmask（0 = 非缩放）
+        self._press_global = None
+        self._start_geo = None
+        self._move_offset = None
+
+        self._timer = QTimer(self)
+        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._timer.timeout.connect(self.update)
+        self._timer.start(max(1, int(1000 / max(1, main.fps))))
+
+    def _move_default(self):
+        """默认落在主屏右下角（避开任务栏，留 40px 边距）。"""
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        geo = screen.availableGeometry()
+        self.move(geo.right() - self.width() - 40, geo.bottom() - self.height() - 40)
+
+    def cycle_color(self):
+        """C 键：基色板轮转 → 只重新生成本窗整套同色系配色。"""
+        self._color_idx = (self._color_idx + 1) % len(PIP_COLORS)
+        self.theme.update(_palette_from_base(QColor(PIP_COLORS[self._color_idx])))
+        self.update()
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key.Key_P, Qt.Key.Key_Escape):
+            self.close()                        # 切回主窗（closeEvent 统一恢复）
+        elif e.key() == Qt.Key.Key_C:
+            self.cycle_color()
+        else:
+            super().keyPressEvent(e)
+
+    def closeEvent(self, e):
+        self._timer.stop()
+        m = self.main
+        if getattr(m, "_pip", None) is self:
+            m._pip = None
+            m.show()
+            m._apply_topmost()
+        super().closeEvent(e)
+
+    # ---- 拖动移动 / 拖边缩放 ----
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            g = e.globalPosition().toPoint()
+            edge = pip_edge_at(e.position().x(), e.position().y(),
+                               self.width(), self.height())
+            if edge:
+                self._resize_mode = edge
+                self._press_global = g
+                self._start_geo = self.frameGeometry()
+            else:
+                self._move_offset = g - self.frameGeometry().topLeft()
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        g = e.globalPosition().toPoint()
+        pressed = bool(e.buttons() & Qt.MouseButton.LeftButton)
+        if self._resize_mode and pressed:
+            dx, dy = g.x() - self._press_global.x(), g.y() - self._press_global.y()
+            s = self._start_geo
+            self.setGeometry(*pip_resize_geom(self._resize_mode,
+                                              s.x(), s.y(), s.width(), s.height(), dx, dy))
+        elif self._move_offset is not None and pressed:
+            self.move(g - self._move_offset)
+        else:
+            edge = pip_edge_at(e.position().x(), e.position().y(),
+                               self.width(), self.height())
+            self.setCursor(_pip_cursor_shape(edge))
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._resize_mode = 0
+            self._press_global = None
+            self._start_geo = None
+            self._move_offset = None
+        super().mouseReleaseEvent(e)
+
+    # ---- 绘制：只有折线 ----
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        p.setPen(Qt.PenStyle.NoPen)
+        bg = QColor(self.theme["bg"])
+        bg.setAlpha(PIP_BG_ALPHA)
+        p.fillRect(0, 0, w, h, bg)
+
+        plot = QRectF(1.0, 1.0, max(0.0, w - 2.0), max(0.0, h - 2.0))
+        if plot.width() >= 2.0 and plot.height() >= 2.0:
+            p.setOpacity(PIP_FILL_OPACITY)      # 渐变填充半透明；折线在 mixin 内恢复 1.0
+            self._draw_spectrum(p, plot)
+        p.end()
 
 
 # ---- 配置加载 ----
